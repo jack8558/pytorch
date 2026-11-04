@@ -96,6 +96,7 @@ from torch.testing._internal.common_cuda import (
 from torch.testing._internal.common_device_type import (
     e4m3_type,
     expectedFailureXPU,
+    instantiate_device_type_tests,
     largeTensorTest,
 )
 from torch.testing._internal.common_dtype import (
@@ -110,6 +111,7 @@ from torch.testing._internal.common_quantization import (
 from torch.testing._internal.common_utils import (
     decorateIf,
     DeterministicGuard,
+    HardwareClassification,
     instantiate_parametrized_tests,
     IS_ARM64,
     IS_CPU_EXT_SVE_SUPPORTED,
@@ -13016,68 +13018,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, [], assert_equal=False)
 
-    # `requires_gpu` otherwise
-    # RuntimeError: pin_memory=True requires a CUDA or other accelerator backend;
-    # no pinned memory allocator is available on this system.
-    @requires_gpu()
-    @unittest.skipIf(IS_MACOS, "fails on macos")
-    @parametrize(
-        "constructor_case",
-        [
-            ("tensor_inline", torch.tensor, ([1, 2, 3],), [3]),
-            ("tensor_constant", torch.tensor, ([[[1.0] * 128] * 128],), [1, 128, 128]),
-            ("empty", torch.empty, ([1, 128, 128],), [1, 128, 128]),
-            ("ones", torch.ones, ([1, 128, 128],), [1, 128, 128]),
-            ("zeros", torch.zeros, ([1, 128, 128],), [1, 128, 128]),
-            (
-                "full",
-                torch.full,
-                (
-                    [1, 128, 128],
-                    2,
-                ),
-                [1, 128, 128],
-            ),
-            ("rand", torch.rand, ([1, 128, 128],), [1, 128, 128]),
-            (
-                "rand_like",
-                torch.rand_like,
-                (torch.empty([1, 128, 128]),),
-                [1, 128, 128],
-            ),
-            ("randn", torch.randn, ([1, 128, 128],), [1, 128, 128]),
-            ("randint", torch.randint, (2, [1, 128, 128]), [1, 128, 128]),
-        ],
-        name_fn=lambda constructor_case: constructor_case[0],
-    )
-    def test_constructors_pin_memory(self, constructor_case):
-        if self.device != "cpu":
-            raise unittest.SkipTest("pin_memory is not supported on non-CPU devices")
-
-        _, constructor, args, expected_shape = constructor_case
-
-        def fn():
-            return constructor(*args, pin_memory=True, device=self.device)
-
-        result = torch.compile(fn, backend="inductor")()
-        self.assertTrue(result.is_pinned())
-        self.assertEqual(result.shape, expected_shape)
-
-    @requires_gpu()
-    @unittest.skipIf(IS_MACOS, "fails on macos")
-    @dynamo_config.patch(assume_static_by_default=False)
-    @config.patch({"fx_graph_cache": False})
-    def test_tensor_pin_memory_dynamic_scalar_list(self):
-        if self.device != "cpu":
-            raise unittest.SkipTest("pin_memory is not supported on non-CPU devices")
-
-        def fn(a, b, c):
-            return torch.tensor([a, b, c], pin_memory=True, device=self.device)
-
-        result = torch.compile(fn, backend="inductor")(1, 2, 3)
-        self.assertTrue(result.is_pinned())
-        self.assertEqual(result, torch.tensor([1, 2, 3], device=self.device))
-
     def test_mkldnn_constant_buffer_is_not_checked_for_pin_memory(self):
         if self.device != "cpu":
             raise unittest.SkipTest("MKLDNN constants are CPU-only")
@@ -21378,6 +21318,65 @@ if RUN_TPU:
         gen = InputGen(10, "tpu")
 
     SweepInputsTpuTest.populate()
+
+
+# Pinned memory is CPU memory, but pinning it needs an accelerator.
+class PinMemoryTests(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @parametrize("dynamic", [False, True])
+    @parametrize(
+        "constructor_case",
+        [
+            # (name, constructor, args, deterministic)
+            ("tensor_inline", torch.tensor, ([1, 2, 3],), True),
+            (
+                "tensor_constant",
+                torch.tensor,
+                (torch.arange(16.0).view(1, 4, 4).tolist(),),
+                True,
+            ),
+            ("empty", torch.empty, ([1, 128, 128],), False),
+            ("ones", torch.ones, ([1, 128, 128],), True),
+            ("zeros", torch.zeros, ([1, 128, 128],), True),
+            ("full", torch.full, ([1, 128, 128], 2), True),
+            ("rand", torch.rand, ([1, 128, 128],), False),
+            ("rand_like", torch.rand_like, (torch.empty([1, 128, 128]),), False),
+            ("randint", torch.randint, (2, [1, 128, 128]), False),
+        ],
+        name_fn=lambda constructor_case: constructor_case[0],
+    )
+    def test_constructors_pin_memory(self, device, constructor_case, dynamic):
+        name, constructor, args, deterministic = constructor_case
+
+        def fn():
+            return constructor(*args, pin_memory=True, device="cpu")
+
+        compiled = torch.compile(fn, fullgraph=True, dynamic=dynamic)
+        result, codes = run_and_get_code(compiled)
+        self.assertTrue(result.is_pinned())
+        code = "\n".join(codes)
+        if name == "tensor_constant" and not dynamic:
+            # Not 1-D, so it must stay a pinned constant rather than be inlined
+            self.assertIn("_tensor_constant0", code)
+        elif dynamic and name != "tensor_constant":
+            # Sizes and values come from a closure; check they weren't specialized
+            self.assertRegex(code, r"\bs\d+\b")
+        actual = result.to(device, non_blocking=True)
+        expected = fn().to(device)
+        if deterministic:
+            self.assertEqual(actual, expected)
+        else:  # random or uninitialized contents
+            self.assertEqual(actual.shape, expected.shape)
+            self.assertEqual(actual.dtype, expected.dtype)
+
+
+# MPS is left out: these tests were skipped on macOS as failing when they lived in
+# CommonTemplate.
+if HAS_CPU:
+    instantiate_device_type_tests(
+        PinMemoryTests, globals(), except_for="cpu", allow_xpu=True
+    )
 
 if RUN_GPU:
 
